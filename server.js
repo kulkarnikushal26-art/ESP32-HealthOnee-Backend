@@ -219,6 +219,74 @@ async function triggerAlertEmail(deviceID, current, aiResult, breaches) {
     }
 }
 
+// --- NEW ENDPOINTS FOR FRONTEND ---
+
+// 1. Get Live Telemetry, History, AI Remark, and Thresholds for a specific Device
+app.get('/api/device/:deviceID', async (req, res) => {
+    const { deviceID } = req.params;
+
+    try {
+        const telemetryColl = db.collection(`${deviceID}_telemetry`);
+        const configsColl = db.collection(`${deviceID}_device_configs`);
+        const aiResponseColl = db.collection(`${deviceID}_AI_response`);
+
+        // Fetch latest single telemetry reading
+        const latestTelemetry = await telemetryColl.find({}).sort({ timestamp: -1 }).limit(1).toArray();
+        
+        // Fetch last 20 telemetry readings for historical charts
+        const history = await telemetryColl.find({}).sort({ timestamp: -1 }).limit(20).toArray();
+        history.reverse(); // Chronological order
+
+        // Fetch latest AI response log
+        const latestAI = await aiResponseColl.find({}).sort({ timestamp: -1 }).limit(1).toArray();
+
+        // Fetch device threshold configurations
+        let thresholds = await configsColl.findOne({});
+        if (!thresholds) {
+            thresholds = DEFAULT_CONFIGS;
+        }
+
+        res.status(200).json({
+            latest: latestTelemetry[0] || null,
+            history: history,
+            aiResponse: latestAI[0] ? latestAI[0].aiAnalysis : null,
+            thresholds: thresholds
+        });
+    } catch (error) {
+        console.error(`Error fetching data for ${deviceID}:`, error);
+        res.status(500).json({ error: "Failed to retrieve device telemetry data." });
+    }
+});
+
+// 2. Update Threshold Configurations for a specific Device
+app.post('/api/device/:deviceID/config', async (req, res) => {
+    const { deviceID } = req.params;
+    const { heartRate, spo2, bodyTemp } = req.body;
+
+    if (!heartRate || !spo2 || !bodyTemp) {
+        return res.status(400).json({ error: "Invalid threshold payload provided." });
+    }
+
+    try {
+        const configsColl = db.collection(`${deviceID}_device_configs`);
+
+        const updatedConfig = {
+            heartRate: { min: Number(heartRate.min), max: Number(heartRate.max) },
+            spo2: { min: Number(spo2.min), max: Number(spo2.max) },
+            bodyTemp: { min: Number(bodyTemp.min), max: Number(bodyTemp.max) },
+            updatedAt: new Date()
+        };
+
+        // Upsert configuration
+        await configsColl.replaceOne({}, updatedConfig, { upsert: true });
+
+        res.status(200).json({ message: "Threshold configurations updated successfully!", config: updatedConfig });
+    } catch (error) {
+        console.error(`Error updating configs for ${deviceID}:`, error);
+        res.status(500).json({ error: "Failed to update device configurations." });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Telemetry pipeline live on port ${PORT}`);
 });
