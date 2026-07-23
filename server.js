@@ -5,6 +5,8 @@ const { MongoClient } = require('mongodb');
 const nodemailer = require('nodemailer');
 
 const app = express();
+
+// Enable CORS for all origins (or restrict to your Vercel URL in production)
 app.use(cors());
 app.use(express.json());
 
@@ -29,10 +31,10 @@ connectDB();
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 587,
-    secure: false, // true for 465, false for 587 (uses STARTTLS)
+    secure: false, // true for 465, false for 587 (STARTTLS)
     auth: {
         user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS // MUST be an App Password, not standard password
+        pass: process.env.EMAIL_PASS // App Password
     },
     tls: {
         rejectUnauthorized: false
@@ -42,15 +44,21 @@ const transporter = nodemailer.createTransport({
     socketTimeout: 5000
 });
 
-// Default configurations if none exist in the database yet
+// Default configurations
 const DEFAULT_CONFIGS = {
     heartRate: { min: 60, max: 100 },
     spo2: { min: 95, max: 100 },
     bodyTemp: { min: 36.0, max: 37.5 }
 };
 
-// 3. Telemetry Processing Endpoint
-// Telemetry Processing Endpoint (Async / Non-Blocking)
+// Helper: Sanitize Mongo ObjectId for JSON responses
+function sanitizeDoc(doc) {
+    if (!doc) return null;
+    const { _id, ...cleanDoc } = doc;
+    return { ...cleanDoc, id: _id ? _id.toString() : undefined };
+}
+
+// 3. Telemetry Processing Endpoint (Async / Non-Blocking for ESP32)
 app.post('/api/telemetry', async (req, res) => {
     const { deviceID, heartRate, spo2, bodyTemp } = req.body;
 
@@ -71,7 +79,6 @@ app.post('/api/telemetry', async (req, res) => {
         await telemetryColl.insertOne(currentReadings);
 
         // Step B: Send HTTP 200 Success ACK to ESP32 IMMEDIATELY
-        // This prevents the ESP32 from timing out while waiting on Groq AI
         res.status(200).json({
             status: "success",
             message: "Telemetry saved successfully."
@@ -123,6 +130,7 @@ app.post('/api/telemetry', async (req, res) => {
         }
     }
 });
+
 // 4. Helper Function: Validate thresholds manually
 function verifyThresholdBreaches(current, config) {
     const breaches = [];
@@ -138,7 +146,7 @@ function verifyThresholdBreaches(current, config) {
     return breaches;
 }
 
-// 5. Helper Function: Streamlined Groq Call using Structured JSON Mode
+// 5. Helper Function: Streamlined Groq Call
 async function queryGroqAI(current, history, thresholds) {
     const systemPrompt = `You are a medical diagnostic assistant monitoring remote telemetry systems.
 Analyze the user's historical trend (last 10 readings sequentially) alongside their custom physiological boundaries to establish structural risk.
@@ -219,9 +227,29 @@ async function triggerAlertEmail(deviceID, current, aiResult, breaches) {
     }
 }
 
-// --- NEW ENDPOINTS FOR FRONTEND ---
+// --- FRONTEND REST ENDPOINTS ---
 
-// 1. Get Live Telemetry, History, AI Remark, and Thresholds for a specific Device
+// 1. Dynamic List of active devices in MongoDB
+app.get('/api/devices', async (req, res) => {
+    try {
+        const collections = await db.listCollections().toArray();
+        const deviceSet = new Set();
+
+        collections.forEach(col => {
+            if (col.name.endsWith('_telemetry')) {
+                const deviceID = col.name.replace('_telemetry', '');
+                deviceSet.add(deviceID);
+            }
+        });
+
+        res.status(200).json({ devices: Array.from(deviceSet) });
+    } catch (error) {
+        console.error("Error fetching device list:", error);
+        res.status(500).json({ error: "Failed to list active devices." });
+    }
+});
+
+// 2. Get Live Telemetry, History, AI Remark, and Thresholds for a specific Device
 app.get('/api/device/:deviceID', async (req, res) => {
     const { deviceID } = req.params;
 
@@ -230,27 +258,27 @@ app.get('/api/device/:deviceID', async (req, res) => {
         const configsColl = db.collection(`${deviceID}_device_configs`);
         const aiResponseColl = db.collection(`${deviceID}_AI_response`);
 
-        // Fetch latest single telemetry reading
+        // Fetch latest telemetry
         const latestTelemetry = await telemetryColl.find({}).sort({ timestamp: -1 }).limit(1).toArray();
         
-        // Fetch last 20 telemetry readings for historical charts
+        // Fetch last 20 telemetry readings for charts
         const history = await telemetryColl.find({}).sort({ timestamp: -1 }).limit(20).toArray();
-        history.reverse(); // Chronological order
+        history.reverse();
 
         // Fetch latest AI response log
         const latestAI = await aiResponseColl.find({}).sort({ timestamp: -1 }).limit(1).toArray();
 
-        // Fetch device threshold configurations
+        // Fetch device thresholds
         let thresholds = await configsColl.findOne({});
         if (!thresholds) {
             thresholds = DEFAULT_CONFIGS;
         }
 
         res.status(200).json({
-            latest: latestTelemetry[0] || null,
-            history: history,
+            latest: sanitizeDoc(latestTelemetry[0]),
+            history: history.map(sanitizeDoc),
             aiResponse: latestAI[0] ? latestAI[0].aiAnalysis : null,
-            thresholds: thresholds
+            thresholds: sanitizeDoc(thresholds)
         });
     } catch (error) {
         console.error(`Error fetching data for ${deviceID}:`, error);
@@ -258,7 +286,7 @@ app.get('/api/device/:deviceID', async (req, res) => {
     }
 });
 
-// 2. Update Threshold Configurations for a specific Device
+// 3. Update Threshold Configurations for a specific Device
 app.post('/api/device/:deviceID/config', async (req, res) => {
     const { deviceID } = req.params;
     const { heartRate, spo2, bodyTemp } = req.body;
