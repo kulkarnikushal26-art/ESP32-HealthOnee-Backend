@@ -42,6 +42,7 @@ const DEFAULT_CONFIGS = {
 };
 
 // 3. Telemetry Processing Endpoint
+// Telemetry Processing Endpoint (Async / Non-Blocking)
 app.post('/api/telemetry', async (req, res) => {
     const { deviceID, heartRate, spo2, bodyTemp } = req.body;
 
@@ -53,60 +54,67 @@ app.post('/api/telemetry', async (req, res) => {
         const timestamp = new Date();
         const currentReadings = { heartRate, spo2, bodyTemp, timestamp };
 
-        // Dynamic Collection Routing based on deviceID
+        // Dynamic Collections
         const telemetryColl = db.collection(`${deviceID}_telemetry`);
         const configsColl = db.collection(`${deviceID}_device_configs`);
         const aiResponseColl = db.collection(`${deviceID}_AI_response`);
 
-        // Step A: Save incoming data point
+        // Step A: Immediately persist incoming telemetry packet
         await telemetryColl.insertOne(currentReadings);
 
-        // Step B: Fetch or Initialize Device Threshold Configurations
-        let thresholds = await configsColl.findOne({});
-        if (!thresholds) {
-            thresholds = { ...DEFAULT_CONFIGS, createdAt: timestamp };
-            await configsColl.insertOne(thresholds);
-        }
-
-        // Step C: Pull historical trend context (last 10 readings)
-        const history = await telemetryColl
-            .find({})
-            .sort({ timestamp: -1 })
-            .limit(10)
-            .toArray();
-        
-        // Reverse history to display oldest to newest chronologically for the LLM
-        history.reverse(); 
-
-        // Step D: Evaluate against Groq Llama 3 API
-        const aiResult = await queryGroqAI(currentReadings, history, thresholds);
-
-        // Step E: Persist AI Assessment
-        const aiLog = {
-            timestamp,
-            telemetryData: currentReadings,
-            aiAnalysis: aiResult
-        };
-        await aiResponseColl.insertOne(aiLog);
-
-        // Step F: Tally thresholds and check if email notification is required
-        const crossedThresholds = verifyThresholdBreaches(currentReadings, thresholds);
-        
-        if (aiResult.status === 'Warning' || aiResult.status === 'Alert' || crossedThresholds.length > 0) {
-            await triggerAlertEmail(deviceID, currentReadings, aiResult, crossedThresholds);
-        }
-
+        // Step B: Send HTTP 200 Success ACK to ESP32 IMMEDIATELY
+        // This prevents the ESP32 from timing out while waiting on Groq AI
         res.status(200).json({
-            message: "Telemetry processed cleanly.",
-            aiResponse: aiResult
+            status: "success",
+            message: "Telemetry saved successfully."
+        });
+
+        // Step C: Execute AI processing & Notifications in BACKGROUND
+        setImmediate(async () => {
+            try {
+                // Fetch or initialize configs
+                let thresholds = await configsColl.findOne({});
+                if (!thresholds) {
+                    thresholds = { ...DEFAULT_CONFIGS, createdAt: timestamp };
+                    await configsColl.insertOne(thresholds);
+                }
+
+                // Get last 10 readings for context
+                const history = await telemetryColl
+                    .find({})
+                    .sort({ timestamp: -1 })
+                    .limit(10)
+                    .toArray();
+                
+                history.reverse();
+
+                // Query Groq AI asynchronously
+                const aiResult = await queryGroqAI(currentReadings, history, thresholds);
+
+                // Save AI log
+                await aiResponseColl.insertOne({
+                    timestamp,
+                    telemetryData: currentReadings,
+                    aiAnalysis: aiResult
+                });
+
+                // Check thresholds & send notification if necessary
+                const crossedThresholds = verifyThresholdBreaches(currentReadings, thresholds);
+                if (aiResult.status === 'Warning' || aiResult.status === 'Alert' || crossedThresholds.length > 0) {
+                    await triggerAlertEmail(deviceID, currentReadings, aiResult, crossedThresholds);
+                }
+            } catch (bgError) {
+                console.error("Background AI processing error:", bgError);
+            }
         });
 
     } catch (error) {
         console.error("System pipeline failure processing data packet:", error);
-        res.status(500).json({ error: "Internal Server Pipeline Exception" });
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Internal Server Pipeline Exception" });
+        }
     }
 });
-
 // 4. Helper Function: Validate thresholds manually
 function verifyThresholdBreaches(current, config) {
     const breaches = [];
