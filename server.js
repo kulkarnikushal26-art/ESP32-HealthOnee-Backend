@@ -16,7 +16,7 @@ const client = new MongoClient(process.env.MONGODB_URI);
 async function connectDB() {
     try {
         await client.connect();
-        db = client.db();
+        db = client.db(Vitals_Monitoring);
         console.log("Connected successfully to MongoDB");
     } catch (err) {
         console.error("MongoDB connection failed:", err);
@@ -27,11 +27,19 @@ connectDB();
 
 // 2. Setup Email Transporter
 const transporter = nodemailer.createTransport({
-    service: process.env.EMAIL_SERVICE,
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false, // true for 465, false for 587 (uses STARTTLS)
     auth: {
         user: process.env.EMAIL_USER,
-        制造: process.env.EMAIL_PASS // Use an App Password if using Gmail
-    }
+        pass: process.env.EMAIL_PASS // MUST be an App Password, not standard password
+    },
+    tls: {
+        rejectUnauthorized: false
+    },
+    connectionTimeout: 5000,
+    greetingTimeout: 5000,
+    socketTimeout: 5000
 });
 
 // Default configurations if none exist in the database yet
